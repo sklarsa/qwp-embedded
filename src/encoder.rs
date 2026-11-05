@@ -20,6 +20,19 @@ pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_DURABLE_ACK: u8 = 0x02;
 pub const STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 pub const STATUS_PARSE_ERROR: u8 = 0x05;
+pub const STATUS_INTERNAL_ERROR: u8 = 0x06;
+pub const STATUS_NOT_WRITABLE: u8 = 0x0C;
+pub const STATUS_DICTIONARY_GAP: u8 = 0x0D;
+
+/// Whether resending the same message can succeed: the spec's transient statuses. Anything else
+/// fails the same way every time, so the message's records should be dropped, not resent.
+/// A reconnect also re-registers the symbol dictionary, which is what DICTIONARY_GAP needs.
+pub fn retriable(status: u8) -> bool {
+    matches!(
+        status,
+        STATUS_INTERNAL_ERROR | STATUS_NOT_WRITABLE | STATUS_DICTIONARY_GAP
+    )
+}
 
 /// The output buffer is too small for the message.
 #[derive(Debug, PartialEq)]
@@ -286,7 +299,7 @@ pub fn parse_response(b: &[u8]) -> Option<(u8, Option<i64>, &[u8])> {
         &[][..]
     } else {
         let n = u16::from_le_bytes(b.get(9..11)?.try_into().ok()?) as usize;
-        b.get(11..11 + n)?
+        b.get(11..(11 + n).min(b.len()))? // the caller may have read only the start of a long one
     };
     Some((status, Some(seq), msg))
 }
@@ -463,5 +476,25 @@ mod tests {
             parse_response(&[2, 0, 0]),
             Some((STATUS_DURABLE_ACK, None, &[][..]))
         );
+        // a 600-byte message read only as far as the buffer: still a rejection, not garbage
+        let long = [3u8, 4, 0, 0, 0, 0, 0, 0, 0, 0x58, 0x02, b'x', b'y'];
+        assert_eq!(
+            parse_response(&long),
+            Some((STATUS_SCHEMA_MISMATCH, Some(4), &b"xy"[..]))
+        );
+    }
+
+    #[test]
+    fn only_transient_statuses_are_retried() {
+        for s in [
+            STATUS_INTERNAL_ERROR,
+            STATUS_NOT_WRITABLE,
+            STATUS_DICTIONARY_GAP,
+        ] {
+            assert!(retriable(s), "{s}");
+        }
+        for s in [STATUS_SCHEMA_MISMATCH, STATUS_PARSE_ERROR, 0x08, 0x09, 0x7F] {
+            assert!(!retriable(s), "{s}");
+        }
     }
 }

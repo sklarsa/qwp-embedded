@@ -97,6 +97,7 @@ pub async fn run<R: Copy>(
         tcp_rx,
         scratch,
     } = buffers;
+    assert!(!scratch.is_empty(), "scratch must hold at least one record");
     let stats = config.stats;
     let mut resp = [0u8; 512];
     stack.wait_config_up().await;
@@ -141,8 +142,9 @@ pub async fn run<R: Copy>(
                     continue;
                 }
                 let unsent = ring.lock(|r| r.borrow().len()) - sent;
-                let due = unsent >= scratch.len() / 4
-                    || (unsent > 0 && last_send.elapsed() >= config.batch_interval);
+                let due = unsent > 0
+                    && (unsent >= (scratch.len() / 4).max(1)
+                        || last_send.elapsed() >= config.batch_interval);
                 if nin > 0 && (nin == MAX_INFLIGHT || !due || sock.can_recv()) {
                     let mut h = [0u8; 10];
                     sock.read_exact(&mut h[..2]).await.map_err(|_| "read")?;
@@ -173,12 +175,13 @@ pub async fn run<R: Copy>(
                                 if status != STATUS_OK {
                                     let msg = core::str::from_utf8(msg).unwrap_or("");
                                     error!("qwp status {status} on seq {seq}: {msg}");
-                                    // bad data never succeeds: drop it rather than wedge the ring
-                                    if status != STATUS_PARSE_ERROR
-                                        && status != STATUS_SCHEMA_MISMATCH
-                                    {
+                                    if retriable(status) {
                                         return Err("server error");
                                     }
+                                    // it would fail the same way forever: drop it rather than
+                                    // wedge the ring. QWP rejects whole messages, so this drops
+                                    // every table in it, not just the one at fault.
+
                                     stats.rejected.fetch_add(1, Relaxed);
                                 }
                                 next_seq += 1;

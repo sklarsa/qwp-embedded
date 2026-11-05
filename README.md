@@ -53,6 +53,8 @@ wide column types and no TTL, so create yours first.
 - `Sec-WebSocket-Accept` isn't verified.
 - No nulls: to leave a column out, leave it out of the table block.
 - The ring drops the newest records when full.
+- QuestDB rejects a whole message, so one bad table drops the other tables' rows sent with it.
+  Statuses that can't succeed on a resend are dropped and counted; transient ones reconnect.
 
 ## Tests
 
