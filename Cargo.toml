@@ -1,0 +1,21 @@
+[package]
+name = "qwp-embedded"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "no_std QuestDB Wire Protocol (QWP) client for microcontrollers"
+repository = "https://github.com/sklarsa/qwp-embedded"
+keywords = ["questdb", "qwp", "embedded", "no-std", "embassy"]
+categories = ["embedded", "no-std", "database"]
+
+[features]
+# The WebSocket sender. Without it the crate is core-only: encoder and ring.
+sender = ["dep:embassy-net", "dep:embassy-sync", "dep:embassy-time", "dep:embedded-io-async", "dep:log"]
+
+[dependencies]
+embassy-net = { version = "0.9.1", features = ["tcp", "medium-ethernet", "proto-ipv4"], optional = true }
+embassy-sync = { version = "0.8.0", optional = true }
+embassy-time = { version = "0.5.0", optional = true }
+embedded-io-async = { version = "0.7.0", optional = true }
+log = { version = "0.4.27", optional = true }
