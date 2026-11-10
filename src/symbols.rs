@@ -6,37 +6,43 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 
-pub const SYMBOLS_MAX: usize = 32;
-pub const SYMBOL_LEN_MAX: usize = 24;
-
-/// Append-only: an entry never changes once added, so readers take no lock and hold `&str`s into
-/// it freely. Only `intern` locks, against another `intern`.
-pub struct Symbols {
+/// Up to `N` names of up to `L` bytes (`L` ≤ 255), all in the struct: size both to the
+/// application. Append-only: an entry never changes once added, so readers take no lock and hold
+/// `&str`s into it freely. Only `intern` locks, against another `intern`.
+pub struct Symbols<const N: usize = 32, const L: usize = 24> {
     /// One cell per slot: writing a slot never borrows the ones readers hold.
-    names: [UnsafeCell<[u8; SYMBOL_LEN_MAX]>; SYMBOLS_MAX],
-    lens: [AtomicU8; SYMBOLS_MAX],
+    names: [UnsafeCell<[u8; L]>; N],
+    lens: [AtomicU8; N],
     len: AtomicUsize,
     writer: Mutex<CriticalSectionRawMutex, ()>,
 }
 
 // SAFETY: entries below `len` are immutable; writes happen above it, under `writer`, and are
 // published by the Release store of `len`.
-unsafe impl Sync for Symbols {}
+unsafe impl<const N: usize, const L: usize> Sync for Symbols<N, L> {}
 
 impl Symbols {
+    /// 32 names of up to 24 bytes. For other sizes, `Symbols::<N, L>::sized()`.
     pub const fn new() -> Self {
+        Self::sized()
+    }
+}
+
+impl<const N: usize, const L: usize> Symbols<N, L> {
+    pub const fn sized() -> Self {
+        const { assert!(L <= u8::MAX as usize, "names are at most 255 bytes") };
         Self {
-            names: [const { UnsafeCell::new([0; SYMBOL_LEN_MAX]) }; SYMBOLS_MAX],
-            lens: [const { AtomicU8::new(0) }; SYMBOLS_MAX],
+            names: [const { UnsafeCell::new([0; L]) }; N],
+            lens: [const { AtomicU8::new(0) }; N],
             len: AtomicUsize::new(0),
             writer: Mutex::new(()),
         }
     }
 
-    /// `s`'s id: the existing one, or the next free. `None` when the table is full or `s` is
-    /// longer than `SYMBOL_LEN_MAX`.
+    /// `s`'s id: the existing one, or the next free. `None` when all `N` are taken or `s` is
+    /// longer than `L` bytes.
     pub fn intern(&self, s: &str) -> Option<u64> {
-        if s.len() > SYMBOL_LEN_MAX {
+        if s.len() > L {
             return None;
         }
         self.writer.lock(|_| {
@@ -44,7 +50,7 @@ impl Symbols {
             if let Some(i) = (0..n).find(|&i| self.get(i) == s) {
                 return Some(i as u64);
             }
-            if n == SYMBOLS_MAX {
+            if n == N {
                 return None;
             }
             // SAFETY: slot n is above len, so no reader looks at it; we hold the writer lock
@@ -66,7 +72,7 @@ impl Symbols {
     /// Every name, in id order.
     pub fn with<R>(&self, f: impl FnOnce(&[&str]) -> R) -> R {
         let n = self.len();
-        let mut all = [""; SYMBOLS_MAX];
+        let mut all = [""; N];
         for (i, slot) in all[..n].iter_mut().enumerate() {
             *slot = self.get(i);
         }
@@ -80,9 +86,9 @@ impl Symbols {
     }
 }
 
-impl Default for Symbols {
+impl<const N: usize, const L: usize> Default for Symbols<N, L> {
     fn default() -> Self {
-        Self::new()
+        Self::sized()
     }
 }
 
@@ -112,6 +118,15 @@ mod tests {
             assert_eq!(names, ["a"]);
         });
         s.with(|n| assert_eq!(n, ["a", "b"]));
+    }
+
+    #[test]
+    fn sized_to_the_application() {
+        let s = Symbols::<2, 4>::sized();
+        assert_eq!(s.intern("abcd"), Some(0));
+        assert_eq!(s.intern("abcde"), None); // longer than 4
+        assert_eq!(s.intern("x"), Some(1));
+        assert_eq!(s.intern("y"), None); // full at 2
     }
 
     #[test]

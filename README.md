@@ -25,27 +25,36 @@ You own all the memory, so the same sender runs on a board with PSRAM or without
 A record type is yours too: any `Copy` type, written to tables by your `encode` function.
 
 ```rust
-static SYMBOLS: Symbols = Symbols::new();
-
 #[embassy_executor::task]
 async fn sender(stack: Stack<'static>, ring: &'static SharedRing<Rec>, buffers: Buffers<Rec>) {
-    let device = SYMBOLS.intern("my-device").unwrap(); // more can be added while run() goes
     let config = Config {
         addr: "192.168.1.10:9000".parse().unwrap(),
         client_id: "my-device/1",
-        symbols: &SYMBOLS,
+        symbols: &["my-device"],
         batch_interval: Duration::from_millis(100),
         stats: &STATS,
     };
     run(stack, ring, buffers, &config, || rng.random(), || None, |e, recs| {
         e.table("readings", recs.len(), &[("device", SYMBOL), ("celsius", FLOAT)])?;
-        e.symbols(recs.iter().map(|_| device))?; // ids from SYMBOLS.intern
+        e.symbols(recs.iter().map(|_| 0))?; // positions in config.symbols
         e.f32s(recs.iter().map(|r| r.celsius))?;
         e.timestamps(recs.iter().map(|r| r.t_us))
     })
     .await
 }
 ```
+
+`symbols` is any `SymbolTable`: a fixed list as above (a slice or array), or a `Symbols` table
+when the names aren't known up front, such as a gateway naming devices as they appear:
+
+```rust
+static SYMBOLS: Symbols = Symbols::new(); // 32 names of up to 24 bytes; Symbols::<N, L>::sized() for others
+
+let id = SYMBOLS.intern("a1b2c3").unwrap(); // add names any time, even while run() goes
+```
+
+Each message carries the names added since the last one. Names are never removed, so size the
+table for everything a run will see.
 
 Timestamps are microseconds since the epoch, taken on the device. QWP creates missing tables with
 wide column types and no TTL, so create yours first.

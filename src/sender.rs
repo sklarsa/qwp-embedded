@@ -31,14 +31,39 @@ const FRAME_HEADER_MAX: usize = 14;
 
 pub type SharedRing<R> = Mutex<CriticalSectionRawMutex, RefCell<Ring<R>>>;
 
-pub struct Config<'a> {
+/// Where a connection's symbol dictionary comes from: a `SYMBOL` column's values are positions in
+/// it. A fixed list (`&["my-device"]`, a `const` array, a slice) is one; so is [`Symbols`], which the
+/// application can add to while `run` goes.
+pub trait SymbolTable {
+    /// Every name so far, in id order. Names may be added between calls, never changed or removed.
+    fn with_names<R>(&self, f: impl FnOnce(&[&str]) -> R) -> R;
+}
+
+impl SymbolTable for [&str] {
+    fn with_names<R>(&self, f: impl FnOnce(&[&str]) -> R) -> R {
+        f(self)
+    }
+}
+
+impl<const N: usize> SymbolTable for [&str; N] {
+    fn with_names<R>(&self, f: impl FnOnce(&[&str]) -> R) -> R {
+        f(self)
+    }
+}
+
+impl<const N: usize, const L: usize> SymbolTable for Symbols<N, L> {
+    fn with_names<R>(&self, f: impl FnOnce(&[&str]) -> R) -> R {
+        self.with(f)
+    }
+}
+
+pub struct Config<'a, S: SymbolTable + ?Sized = [&'a str]> {
     pub addr: SocketAddrV4,
     /// Sent as `X-QWP-Client-Id`.
     pub client_id: &'a str,
-    /// The symbol dictionary: a `SYMBOL` column's values are ids from `Symbols::intern`. Each
-    /// message carries the names added since the last one; the whole table again after a
-    /// reconnect. The application may intern more while the sender runs.
-    pub symbols: &'a Symbols,
+    /// The symbol dictionary. Each message carries the names added since the last one; the whole
+    /// table again after a reconnect.
+    pub symbols: &'a S,
     /// Longest a record waits for a batch to fill.
     pub batch_interval: Duration,
     pub stats: &'a Stats,
@@ -87,11 +112,11 @@ pub struct Buffers<R: 'static> {
 ///
 /// `random` feeds the WebSocket masks and key. `priority` yields records that must get out even
 /// when the ring is full; they aren't kept for re-sending. `encode` writes records to tables.
-pub async fn run<R: Copy>(
+pub async fn run<R: Copy, S: SymbolTable + ?Sized>(
     stack: Stack<'static>,
     ring: &SharedRing<R>,
     buffers: Buffers<R>,
-    config: &Config<'_>,
+    config: &Config<'_, S>,
     random: impl Fn() -> u32,
     mut priority: impl FnMut() -> Option<R>,
     encode: impl Fn(&mut Encoder<'_>, &[R]) -> Result<(), Full>,
@@ -291,14 +316,14 @@ fn err_code(e: &str) -> u32 {
 /// One message: the symbols QuestDB hasn't seen on this connection, then the records. Returns its
 /// length and the symbols sent so far. The table is read after `recs` were taken from the ring, and
 /// a record only holds ids interned before it was pushed, so every id in it is covered.
-fn message<R>(
+fn message<R, S: SymbolTable + ?Sized>(
     out: &mut [u8],
-    symbols: &Symbols,
+    symbols: &S,
     symbols_sent: usize,
     recs: &[R],
     encode: &impl Fn(&mut Encoder<'_>, &[R]) -> Result<(), Full>,
 ) -> Result<(usize, usize), Full> {
-    symbols.with(|names| {
+    symbols.with_names(|names| {
         let mut e = Encoder::with_symbols(out, symbols_sent as u64, &names[symbols_sent..])?;
         encode(&mut e, recs)?;
         Ok((e.finish(), names.len()))
@@ -413,6 +438,49 @@ mod tests {
     use super::*;
 
     /// A name interned mid-connection goes out, alone, in the next message's delta.
+    /// Fixed lists keep working the way they did before Symbols existed.
+    #[test]
+    fn fixed_lists_still_configure() {
+        static STATS: Stats = Stats::new();
+        const LIST: [&str; 2] = ["dev", "comet"];
+        let slice: &[&str] = &LIST;
+        let addr = "10.0.0.1:9000".parse().unwrap();
+        let _ = Config {
+            addr,
+            client_id: "t",
+            symbols: &["dev"],
+            batch_interval: Duration::from_millis(100),
+            stats: &STATS,
+        };
+        let _ = Config {
+            addr,
+            client_id: "t",
+            symbols: &LIST,
+            batch_interval: Duration::from_millis(100),
+            stats: &STATS,
+        };
+        let _ = Config {
+            addr,
+            client_id: "t",
+            symbols: slice,
+            batch_interval: Duration::from_millis(100),
+            stats: &STATS,
+        };
+    }
+
+    /// A fixed list goes out whole on a connection's first message, then never again.
+    #[test]
+    fn message_sends_fixed_list_once() {
+        let enc = |_: &mut Encoder<'_>, _: &[u8]| -> Result<(), Full> { Ok(()) };
+        let mut out = [0u8; 64];
+        let (n, sent) = message(&mut out, &["ab", "c"], 0, &[0u8], &enc).unwrap();
+        assert_eq!(sent, 2);
+        assert_eq!(&out[12..n], &[0, 2, 2, b'a', b'b', 1, b'c']);
+        let (n, sent) = message(&mut out, &["ab", "c"], sent, &[0u8], &enc).unwrap();
+        assert_eq!(sent, 2);
+        assert_eq!(&out[12..n], &[2, 0]);
+    }
+
     #[test]
     fn message_sends_new_symbols_only() {
         let syms = Symbols::new();
