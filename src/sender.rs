@@ -23,6 +23,10 @@ pub const ERR_SERVER: u32 = 4;
 pub const ERR_PROTOCOL: u32 = 5;
 
 const MAX_INFLIGHT: usize = 8;
+/// Retriable rejections of the same message before it's dropped as poison, as in the reference
+/// client's `max_frame_rejections`. A device has no disk to park it on, so it's dropped and counted
+/// in `Stats::rejected` instead of halting.
+const MAX_FRAME_REJECTIONS: u32 = 4;
 const FRAME_HEADER_MAX: usize = 14;
 
 pub type SharedRing<R> = Mutex<CriticalSectionRawMutex, RefCell<Ring<R>>>;
@@ -100,6 +104,7 @@ pub async fn run<R: Copy>(
     assert!(!scratch.is_empty(), "scratch must hold at least one record");
     let stats = config.stats;
     let mut resp = [0u8; 512];
+    let mut strikes = 0; // consecutive retriable rejections of the oldest unacked message
     stack.wait_config_up().await;
     loop {
         let mut sock = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
@@ -113,12 +118,11 @@ pub async fn run<R: Copy>(
                 .min(body.len() - FRAME_HEADER_MAX);
             info!("qwp connected, max payload {max_payload} B");
 
-            let (mut inflight, mut nin, mut sent, mut next_seq) =
-                ([0usize; MAX_INFLIGHT], 0, 0, 0i64); // records per unacked message, oldest first; sent = their sum
+            let mut inflight = Inflight::<MAX_INFLIGHT>::new();
             let mut symbols_sent = 0;
             let mut last_send = Instant::now();
             loop {
-                if nin < MAX_INFLIGHT
+                if !inflight.is_full()
                     && let Some(r) = priority()
                 {
                     let len = message(
@@ -137,15 +141,15 @@ pub async fn run<R: Copy>(
                     stats
                         .tx_bytes
                         .fetch_add((FRAME_HEADER_MAX + len - start) as u32, Relaxed);
-                    inflight[nin] = 0; // not from the ring, so its ack pops nothing
-                    nin += 1;
+                    inflight.push(0); // not from the ring, so its ack pops nothing
                     continue;
                 }
+                let sent = inflight.records();
                 let unsent = ring.lock(|r| r.borrow().len()) - sent;
                 let due = unsent > 0
                     && (unsent >= (scratch.len() / 4).max(1)
                         || last_send.elapsed() >= config.batch_interval);
-                if nin > 0 && (nin == MAX_INFLIGHT || !due || sock.can_recv()) {
+                if inflight.len() > 0 && (inflight.is_full() || !due || sock.can_recv()) {
                     let mut h = [0u8; 10];
                     sock.read_exact(&mut h[..2]).await.map_err(|_| "read")?;
                     let ext = match h[1] & 0x7F {
@@ -166,30 +170,44 @@ pub async fn run<R: Copy>(
                     }
                     match op {
                         WS_BINARY => match parse_response(&resp[..take]) {
-                            Some((STATUS_DURABLE_ACK, ..)) => {}
-                            Some((status, Some(seq), msg)) => {
-                                if seq != next_seq {
-                                    error!("qwp ack seq {seq}, expected {next_seq}");
+                            Some((STATUS_DURABLE_ACK, ..)) => {} // never requested
+                            Some((STATUS_OK, Some(seq), _)) => {
+                                // cumulative: acks every message up to seq
+                                let Some(n) = inflight.ok(seq) else {
+                                    error!(
+                                        "qwp ack seq {seq}, in flight {}..{}",
+                                        inflight.next_seq(),
+                                        inflight.next_seq() + inflight.len() as i64
+                                    );
                                     return Err("seq");
+                                };
+                                if n > 0 {
+                                    strikes = 0;
                                 }
-                                if status != STATUS_OK {
-                                    let msg = core::str::from_utf8(msg).unwrap_or("");
-                                    error!("qwp status {status} on seq {seq}: {msg}");
-                                    if retriable(status) {
-                                        return Err("server error");
-                                    }
+                                stats.acks.fetch_add(1, Relaxed);
+                                ring.lock(|r| r.borrow_mut().pop(n));
+                            }
+                            Some((status, Some(seq), msg)) => {
+                                let msg = core::str::from_utf8(msg).unwrap_or("");
+                                error!("qwp status {status} on seq {seq}: {msg}");
+                                let Some(n) = inflight.error(seq) else {
+                                    error!("qwp error seq {seq}, expected {}", inflight.next_seq());
+                                    return Err("seq");
+                                };
+                                strikes += 1;
+                                if !retriable(status) || strikes >= MAX_FRAME_REJECTIONS {
                                     // it would fail the same way forever: drop it rather than
                                     // wedge the ring. QWP rejects whole messages, so this drops
                                     // every table in it, not just the one at fault.
-
+                                    warn!(
+                                        "qwp: dropping {n} records rejected with status {status}"
+                                    );
+                                    ring.lock(|r| r.borrow_mut().pop(n));
                                     stats.rejected.fetch_add(1, Relaxed);
+                                    strikes = 0;
                                 }
-                                next_seq += 1;
-                                stats.acks.fetch_add(1, Relaxed);
-                                ring.lock(|r| r.borrow_mut().pop(inflight[0]));
-                                sent -= inflight[0];
-                                inflight.copy_within(1..nin, 0);
-                                nin -= 1;
+                                // the server refuses every later frame on this connection
+                                return Err("server error");
                             }
                             _ => return Err("bad response"),
                         },
@@ -243,9 +261,7 @@ pub async fn run<R: Copy>(
                 stats
                     .tx_bytes
                     .fetch_add((FRAME_HEADER_MAX + len - start) as u32, Relaxed);
-                inflight[nin] = k;
-                nin += 1;
-                sent += k;
+                inflight.push(k);
                 last_send = Instant::now();
             }
         }

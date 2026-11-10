@@ -10,7 +10,7 @@ ESP32-S3, and also runs on an ESP32-C6. Any target with embassy-net should work.
   dependencies.
 - **`Ring`**: drop-newest record buffer. Records stay until QuestDB acks them.
 - **`sender::run`** (feature `sender`): streams a ring over WebSocket, pipelining up to 8 messages
-  and re-sending anything unacked after a reconnect.
+  and re-sending anything unacked after a reconnect (see [Acks and errors](#acks-and-errors)).
 
 ## Sizing to the board
 
@@ -54,7 +54,22 @@ wide column types and no TTL, so create yours first.
 - No nulls: to leave a column out, leave it out of the table block.
 - The ring drops the newest records when full.
 - QuestDB rejects a whole message, so one bad table drops the other tables' rows sent with it.
-  Statuses that can't succeed on a resend are dropped and counted; transient ones reconnect.
+
+## Acks and errors
+
+As QuestDB's server does it, which is not quite what the protocol page says:
+
+- **OK acks are cumulative.** `OK seq=N` acks every message up to N on the connection. The server
+  coalesces them (at least every 64 messages, and whenever a socket read ends), so one OK often
+  covers several pipelined messages.
+- **An error ends the connection's pipeline.** The server acks everything before the failed message
+  first, then refuses every later one without answering. The sender reconnects and re-sends from
+  the failed message.
+- **What gets dropped.** Following the reference client's policy, only rejections that would repeat
+  on an identical resend are permanent: schema mismatch, parse error, security error. Everything
+  else, unknown statuses included, is retried. A message rejected 4 times in a row is treated as
+  poison. Without a disk to park permanent failures on, the sender drops them and counts them in
+  `Stats::rejected` rather than halting.
 
 ## Tests
 

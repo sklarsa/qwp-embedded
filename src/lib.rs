@@ -7,9 +7,13 @@
 #![cfg_attr(not(test), no_std)]
 
 mod encoder;
+#[cfg(any(test, feature = "sender"))]
+mod inflight;
 mod ring;
 #[cfg(feature = "sender")]
 pub mod sender;
 
 pub use encoder::*;
+#[cfg(feature = "sender")]
+use inflight::Inflight;
 pub use ring::Ring;

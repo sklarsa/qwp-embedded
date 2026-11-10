@@ -21,16 +21,19 @@ pub const STATUS_DURABLE_ACK: u8 = 0x02;
 pub const STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 pub const STATUS_PARSE_ERROR: u8 = 0x05;
 pub const STATUS_INTERNAL_ERROR: u8 = 0x06;
+pub const STATUS_SECURITY_ERROR: u8 = 0x08;
+pub const STATUS_WRITE_ERROR: u8 = 0x09;
 pub const STATUS_NOT_WRITABLE: u8 = 0x0C;
 pub const STATUS_DICTIONARY_GAP: u8 = 0x0D;
 
-/// Whether resending the same message can succeed: the spec's transient statuses. Anything else
-/// fails the same way every time, so the message's records should be dropped, not resent.
-/// A reconnect also re-registers the symbol dictionary, which is what DICTIONARY_GAP needs.
+/// Whether resending the same message can succeed. Only rejections that would repeat on a
+/// byte-identical resend are permanent, as in the reference client's NACK policy: schema
+/// mismatch, parse error, security error. Everything else, including statuses this crate doesn't
+/// know, is retried on a fresh connection.
 pub fn retriable(status: u8) -> bool {
-    matches!(
+    !matches!(
         status,
-        STATUS_INTERNAL_ERROR | STATUS_NOT_WRITABLE | STATUS_DICTIONARY_GAP
+        STATUS_SCHEMA_MISMATCH | STATUS_PARSE_ERROR | STATUS_SECURITY_ERROR
     )
 }
 
@@ -485,15 +488,21 @@ mod tests {
     }
 
     #[test]
-    fn only_transient_statuses_are_retried() {
+    fn only_replay_identical_rejections_are_permanent() {
         for s in [
             STATUS_INTERNAL_ERROR,
+            STATUS_WRITE_ERROR,
             STATUS_NOT_WRITABLE,
             STATUS_DICTIONARY_GAP,
+            0x7F, // unknown: fail open
         ] {
             assert!(retriable(s), "{s}");
         }
-        for s in [STATUS_SCHEMA_MISMATCH, STATUS_PARSE_ERROR, 0x08, 0x09, 0x7F] {
+        for s in [
+            STATUS_SCHEMA_MISMATCH,
+            STATUS_PARSE_ERROR,
+            STATUS_SECURITY_ERROR,
+        ] {
             assert!(!retriable(s), "{s}");
         }
     }
