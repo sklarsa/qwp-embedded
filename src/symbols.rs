@@ -12,7 +12,8 @@ pub const SYMBOL_LEN_MAX: usize = 24;
 /// Append-only: an entry never changes once added, so readers take no lock and hold `&str`s into
 /// it freely. Only `intern` locks, against another `intern`.
 pub struct Symbols {
-    names: UnsafeCell<[[u8; SYMBOL_LEN_MAX]; SYMBOLS_MAX]>,
+    /// One cell per slot: writing a slot never borrows the ones readers hold.
+    names: [UnsafeCell<[u8; SYMBOL_LEN_MAX]>; SYMBOLS_MAX],
     lens: [AtomicU8; SYMBOLS_MAX],
     len: AtomicUsize,
     writer: Mutex<CriticalSectionRawMutex, ()>,
@@ -25,7 +26,7 @@ unsafe impl Sync for Symbols {}
 impl Symbols {
     pub const fn new() -> Self {
         Self {
-            names: UnsafeCell::new([[0; SYMBOL_LEN_MAX]; SYMBOLS_MAX]),
+            names: [const { UnsafeCell::new([0; SYMBOL_LEN_MAX]) }; SYMBOLS_MAX],
             lens: [const { AtomicU8::new(0) }; SYMBOLS_MAX],
             len: AtomicUsize::new(0),
             writer: Mutex::new(()),
@@ -47,7 +48,7 @@ impl Symbols {
                 return None;
             }
             // SAFETY: slot n is above len, so no reader looks at it; we hold the writer lock
-            unsafe { (&mut *self.names.get())[n][..s.len()].copy_from_slice(s.as_bytes()) };
+            unsafe { (&mut *self.names[n].get())[..s.len()].copy_from_slice(s.as_bytes()) };
             self.lens[n].store(s.len() as u8, Relaxed);
             self.len.store(n + 1, Release);
             Some(n as u64)
@@ -75,7 +76,7 @@ impl Symbols {
     fn get(&self, i: usize) -> &str {
         let l = self.lens[i].load(Relaxed) as usize;
         // SAFETY: i < len, so the entry is immutable and was written from a &str
-        unsafe { core::str::from_utf8_unchecked(&(&*self.names.get())[i][..l]) }
+        unsafe { core::str::from_utf8_unchecked(&(&*self.names[i].get())[..l]) }
     }
 }
 
@@ -97,6 +98,20 @@ mod tests {
         assert_eq!(s.intern("a1b2c3"), Some(0));
         assert_eq!(s.len(), 2);
         s.with(|n| assert_eq!(n, ["a1b2c3", "0.3.0"]));
+    }
+
+    /// Under Miri: a reader holding names while another thread interns must not alias a `&mut`.
+    #[test]
+    fn intern_while_reading() {
+        let s = Symbols::new();
+        s.intern("a");
+        s.with(|names| {
+            std::thread::scope(|t| {
+                t.spawn(|| s.intern("b"));
+            });
+            assert_eq!(names, ["a"]);
+        });
+        s.with(|n| assert_eq!(n, ["a", "b"]));
     }
 
     #[test]
