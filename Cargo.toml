@@ -19,3 +19,6 @@ embassy-sync = { version = "0.8.0", optional = true }
 embassy-time = { version = "0.5.0", optional = true }
 embedded-io-async = { version = "0.7.0", optional = true }
 log = { version = "0.4.27", optional = true }
+
+[dev-dependencies]
+critical-section = { version = "1.2", features = ["std"] }

@@ -35,9 +35,10 @@ pub struct Config<'a> {
     pub addr: SocketAddrV4,
     /// Sent as `X-QWP-Client-Id`.
     pub client_id: &'a str,
-    /// The symbol dictionary: a `SYMBOL` column's values are indexes into this. Sent once per
-    /// connection, on its first message.
-    pub symbols: &'a [&'a str],
+    /// The symbol dictionary: a `SYMBOL` column's values are ids from `Symbols::intern`. Each
+    /// message carries the names added since the last one; the whole table again after a
+    /// reconnect. The application may intern more while the sender runs.
+    pub symbols: &'a Symbols,
     /// Longest a record waits for a batch to fill.
     pub batch_interval: Duration,
     pub stats: &'a Stats,
@@ -125,7 +126,8 @@ pub async fn run<R: Copy>(
                 if !inflight.is_full()
                     && let Some(r) = priority()
                 {
-                    let len = message(
+                    let len;
+                    (len, symbols_sent) = message(
                         &mut body[FRAME_HEADER_MAX..FRAME_HEADER_MAX + max_payload],
                         config.symbols,
                         symbols_sent,
@@ -133,7 +135,6 @@ pub async fn run<R: Copy>(
                         &encode,
                     )
                     .map_err(|_| "record exceeds max payload")?;
-                    symbols_sent = config.symbols.len();
                     let start = ws_frame(body, len, &random);
                     sock.write_all(&body[start..FRAME_HEADER_MAX + len])
                         .await
@@ -237,7 +238,8 @@ pub async fn run<R: Copy>(
                 // SAFETY: the first k slots were just written
                 let recs = unsafe { core::slice::from_raw_parts(scratch.as_ptr().cast::<R>(), k) };
                 let t0 = Instant::now();
-                let len = loop {
+                let len;
+                (len, symbols_sent) = loop {
                     match message(
                         &mut body[FRAME_HEADER_MAX..FRAME_HEADER_MAX + max_payload],
                         config.symbols,
@@ -245,12 +247,11 @@ pub async fn run<R: Copy>(
                         &recs[..k],
                         &encode,
                     ) {
-                        Ok(n) => break n,
+                        Ok(r) => break r,
                         Err(_) if k > 1 => k /= 2,
                         Err(_) => return Err("record exceeds max payload"),
                     }
                 };
-                symbols_sent = config.symbols.len();
                 let start = ws_frame(body, len, &random);
                 stats
                     .encode_us
@@ -287,17 +288,21 @@ fn err_code(e: &str) -> u32 {
     }
 }
 
-/// One message: the symbols QuestDB hasn't seen on this connection, then the records.
+/// One message: the symbols QuestDB hasn't seen on this connection, then the records. Returns its
+/// length and the symbols sent so far. The table is read after `recs` were taken from the ring, and
+/// a record only holds ids interned before it was pushed, so every id in it is covered.
 fn message<R>(
     out: &mut [u8],
-    symbols: &[&str],
+    symbols: &Symbols,
     symbols_sent: usize,
     recs: &[R],
     encode: &impl Fn(&mut Encoder<'_>, &[R]) -> Result<(), Full>,
-) -> Result<usize, Full> {
-    let mut e = Encoder::with_symbols(out, symbols_sent as u64, &symbols[symbols_sent..])?;
-    encode(&mut e, recs)?;
-    Ok(e.finish())
+) -> Result<(usize, usize), Full> {
+    symbols.with(|names| {
+        let mut e = Encoder::with_symbols(out, symbols_sent as u64, &names[symbols_sent..])?;
+        encode(&mut e, recs)?;
+        Ok((e.finish(), names.len()))
+    })
 }
 
 /// Masks the payload at `body[FRAME_HEADER_MAX..][..len]` and writes a binary frame header just
@@ -401,4 +406,24 @@ async fn upgrade(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1_900_000);
     Ok(max / 10 * 9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name interned mid-connection goes out, alone, in the next message's delta.
+    #[test]
+    fn message_sends_new_symbols_only() {
+        let syms = Symbols::new();
+        syms.intern("dev-a");
+        let enc = |_: &mut Encoder<'_>, _: &[u8]| -> Result<(), Full> { Ok(()) };
+        let mut out = [0u8; 64];
+        let (_, sent) = message(&mut out, &syms, 0, &[0u8], &enc).unwrap();
+        assert_eq!(sent, 1);
+        syms.intern("dev-b");
+        let (n, sent) = message(&mut out, &syms, sent, &[0u8], &enc).unwrap();
+        assert_eq!(sent, 2);
+        assert_eq!(&out[12..n], &[1, 1, 5, b'd', b'e', b'v', b'-', b'b']);
+    }
 }

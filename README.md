@@ -25,18 +25,21 @@ You own all the memory, so the same sender runs on a board with PSRAM or without
 A record type is yours too: any `Copy` type, written to tables by your `encode` function.
 
 ```rust
+static SYMBOLS: Symbols = Symbols::new();
+
 #[embassy_executor::task]
 async fn sender(stack: Stack<'static>, ring: &'static SharedRing<Rec>, buffers: Buffers<Rec>) {
+    let device = SYMBOLS.intern("my-device").unwrap(); // more can be added while run() goes
     let config = Config {
         addr: "192.168.1.10:9000".parse().unwrap(),
         client_id: "my-device/1",
-        symbols: &["my-device"],
+        symbols: &SYMBOLS,
         batch_interval: Duration::from_millis(100),
         stats: &STATS,
     };
     run(stack, ring, buffers, &config, || rng.random(), || None, |e, recs| {
         e.table("readings", recs.len(), &[("device", SYMBOL), ("celsius", FLOAT)])?;
-        e.symbols(recs.iter().map(|_| 0))?; // index into config.symbols
+        e.symbols(recs.iter().map(|_| device))?; // ids from SYMBOLS.intern
         e.f32s(recs.iter().map(|r| r.celsius))?;
         e.timestamps(recs.iter().map(|r| r.t_us))
     })

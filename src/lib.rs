@@ -12,8 +12,12 @@ mod inflight;
 mod ring;
 #[cfg(feature = "sender")]
 pub mod sender;
+#[cfg(feature = "sender")]
+mod symbols;
 
 pub use encoder::*;
 #[cfg(feature = "sender")]
 use inflight::Inflight;
 pub use ring::Ring;
+#[cfg(feature = "sender")]
+pub use symbols::*;
