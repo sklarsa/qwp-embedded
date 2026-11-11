@@ -135,6 +135,8 @@ pub async fn run<R: Copy, S: SymbolTable + ?Sized>(
     loop {
         let mut sock = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
         sock.set_timeout(Some(Duration::from_secs(10)));
+        // Idle between batches is fine: keepalives stop the timeout from aborting it
+        sock.set_keep_alive(Some(Duration::from_secs(5)));
         let result: Result<(), &str> = async {
             sock.connect((*config.addr.ip(), config.addr.port()))
                 .await
