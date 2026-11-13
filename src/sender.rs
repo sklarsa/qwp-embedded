@@ -1,7 +1,7 @@
 //! Streams a [`Ring`] to QuestDB over WebSocket. Records leave the ring only when QuestDB acks the
 //! message that carried them; on reconnect everything unacked is re-sent.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::fmt::Write as _;
 use core::mem::MaybeUninit;
 use core::net::SocketAddrV4;
@@ -58,7 +58,8 @@ impl<const N: usize, const L: usize> SymbolTable for Symbols<N, L> {
 }
 
 pub struct Config<'a, S: SymbolTable + ?Sized = [&'a str]> {
-    pub addr: SocketAddrV4,
+    /// Where to send. The sender reconnects when it changes; unacked records go to the new one.
+    pub addr: &'a Addr,
     /// Sent as `X-QWP-Client-Id`.
     pub client_id: &'a str,
     /// The symbol dictionary. Each message carries the names added since the last one; the whole
@@ -67,6 +68,23 @@ pub struct Config<'a, S: SymbolTable + ?Sized = [&'a str]> {
     /// Longest a record waits for a batch to fill.
     pub batch_interval: Duration,
     pub stats: &'a Stats,
+}
+
+/// The server's address, which the application may change while the sender runs.
+pub struct Addr(Mutex<CriticalSectionRawMutex, Cell<SocketAddrV4>>);
+
+impl Addr {
+    pub const fn new(a: SocketAddrV4) -> Self {
+        Self(Mutex::new(Cell::new(a)))
+    }
+
+    pub fn get(&self) -> SocketAddrV4 {
+        self.0.lock(Cell::get)
+    }
+
+    pub fn set(&self, a: SocketAddrV4) {
+        self.0.lock(|c| c.set(a))
+    }
 }
 
 /// Counters for the application's own telemetry. All but `last_error` are cumulative, except that
@@ -138,7 +156,8 @@ pub async fn run<R: Copy, S: SymbolTable + ?Sized>(
         // Idle between batches is fine: keepalives stop the timeout from aborting it
         sock.set_keep_alive(Some(Duration::from_secs(5)));
         let result: Result<(), &str> = async {
-            sock.connect((*config.addr.ip(), config.addr.port()))
+            let addr = config.addr.get();
+            sock.connect((*addr.ip(), addr.port()))
                 .await
                 .map_err(|_| "connect")?;
             let max_payload = upgrade(&mut sock, &mut resp, config.client_id, &random)
@@ -150,6 +169,9 @@ pub async fn run<R: Copy, S: SymbolTable + ?Sized>(
             let mut symbols_sent = 0;
             let mut last_send = Instant::now();
             loop {
+                if config.addr.get() != addr {
+                    return Err("address changed");
+                }
                 if !inflight.is_full()
                     && let Some(r) = priority()
                 {
@@ -294,7 +316,9 @@ pub async fn run<R: Copy, S: SymbolTable + ?Sized>(
             }
         }
         .await;
-        if let Err(e) = result {
+        if let Err(e) = result
+            && e != "address changed"
+        {
             stats.reconnects.fetch_add(1, Relaxed);
             stats.last_error.store(err_code(e), Relaxed);
             warn!("qwp: {e}, reconnecting");
@@ -446,7 +470,10 @@ mod tests {
         static STATS: Stats = Stats::new();
         const LIST: [&str; 2] = ["dev", "comet"];
         let slice: &[&str] = &LIST;
-        let addr = "10.0.0.1:9000".parse().unwrap();
+        let addr = &Addr::new(SocketAddrV4::new(
+            core::net::Ipv4Addr::new(10, 0, 0, 1),
+            9000,
+        ));
         let _ = Config {
             addr,
             client_id: "t",
