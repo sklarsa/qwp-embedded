@@ -50,7 +50,7 @@ impl<const N: usize> Inflight<N> {
     /// `OK seq`: retires every message up to `seq`; returns how many ring records they carried.
     /// None if `seq` isn't a message in flight.
     pub(crate) fn ok(&mut self, seq: i64) -> Option<usize> {
-        let k = usize::try_from(seq - self.next_seq).ok()? + 1;
+        let k = usize::try_from(seq.checked_sub(self.next_seq)?).ok()? + 1;
         (k <= self.len).then(|| self.retire(k))
     }
 
@@ -93,6 +93,9 @@ mod tests {
         assert_eq!(f.ok(1), None); // never sent
         f.ok(0).unwrap();
         assert_eq!(f.ok(0), None); // already acked
+        f.push(1);
+        assert_eq!(f.ok(i64::MIN), None); // a hostile ack, not an overflow panic
+        assert_eq!(f.ok(i64::MAX), None);
     }
 
     #[test]

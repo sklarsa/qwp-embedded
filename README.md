@@ -27,8 +27,9 @@ A record type is yours too: any `Copy` type, written to tables by your `encode` 
 ```rust
 #[embassy_executor::task]
 async fn sender(stack: Stack<'static>, ring: &'static SharedRing<Rec>, buffers: Buffers<Rec>) {
+    static ADDR: Addr = Addr::new(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 9000));
     let config = Config {
-        addr: "192.168.1.10:9000".parse().unwrap(),
+        addr: &ADDR, // ADDR.set(..) later moves the sender to another server
         client_id: "my-device/1",
         symbols: &["my-device"],
         batch_interval: Duration::from_millis(100),
